@@ -1,22 +1,5 @@
-/**
- * Standalone Data Loader
- * Uses CORS proxy to fetch Google Sheets data
- */
-
+// 구글 시트 데이터를 자동으로 로드하는 모듈 (CORS 우회 강화 버전)
 const DATA_LOADER = (() => {
-    // Google Sheets Configuration
-    const SHEET_ID = '1U8WL2QcUY-Ujh8pJW6D4zljvRx1lFQkRH8-PXOReXwg';
-    const GID = '0';
-    
-    // Multiple CORS proxy options (fallback if one fails)
-    const PROXY_OPTIONS = [
-        `https://api.allorigins.win/raw?url=`,
-        `https://corsproxy.io/?`,
-        `https://cors-anywhere.herokuapp.com/`
-    ];
-    
-    let currentProxyIndex = 0;
-    let rawData = [];
     let processedData = {
         dates: [],
         stores: [],
@@ -24,98 +7,184 @@ const DATA_LOADER = (() => {
         dataByStore: {}
     };
 
-    /**
-     * Get current proxy URL
-     */
-    function getProxyUrl() {
-        const csvUrl = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${GID}`;
-        return PROXY_OPTIONS[currentProxyIndex] + encodeURIComponent(csvUrl);
-    }
+    const SHEET_ID = '1U8WL2QcUY-Ujh8pJW6D4zljvRx1lFQkRH8-PXOReXwg';
+    const SHEET_GID = '0';
+    
+    // 여러 CORS 프록시 옵션 (더 많이 추가)
+    const CORS_PROXIES = [
+        // 방법 1: 직접 CSV 다운로드 (프록시 없이)
+        {
+            name: 'Direct CSV',
+            getUrl: () => `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${SHEET_GID}`
+        },
+        // 방법 2: AllOrigins
+        {
+            name: 'AllOrigins',
+            getUrl: () => `https://api.allorigins.win/raw?url=${encodeURIComponent(`https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${SHEET_GID}`)}`
+        },
+        // 방법 3: CORS Anywhere (Heroku)
+        {
+            name: 'CORS Anywhere',
+            getUrl: () => `https://cors-anywhere.herokuapp.com/https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${SHEET_GID}`
+        },
+        // 방법 4: ThingProxy
+        {
+            name: 'ThingProxy',
+            getUrl: () => `https://thingproxy.freeboard.io/fetch/https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${SHEET_GID}`
+        },
+        // 방법 5: Cloudflare Workers (public)
+        {
+            name: 'Cloudflare',
+            getUrl: () => `https://corsproxy.io/?${encodeURIComponent(`https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=csv&gid=${SHEET_GID}`)}`
+        },
+        // 방법 6: Google Apps Script 방식
+        {
+            name: 'Google TSV',
+            getUrl: () => `https://docs.google.com/spreadsheets/d/${SHEET_ID}/export?format=tsv&gid=${SHEET_GID}`,
+            isTSV: true
+        }
+    ];
 
-    /**
-     * Fetch data from Google Sheets with fallback proxies
-     */
+    // 데이터 로드 (여러 프록시 자동 시도)
     async function fetchData() {
-        let lastError = null;
+        console.log('🔄 데이터 로드 시작...');
         
-        // Try each proxy option
-        for (let i = 0; i < PROXY_OPTIONS.length; i++) {
-            currentProxyIndex = i;
+        for (let i = 0; i < CORS_PROXIES.length; i++) {
+            const proxy = CORS_PROXIES[i];
             try {
-                console.log(`Attempting to fetch data using proxy ${i + 1}...`);
-                const response = await fetch(getProxyUrl(), {
+                console.log(`시도 ${i + 1}/${CORS_PROXIES.length}: ${proxy.name}`);
+                
+                const url = proxy.getUrl();
+                const response = await fetch(url, {
                     method: 'GET',
                     headers: {
-                        'Accept': 'text/csv'
-                    }
+                        'Accept': 'text/csv, text/plain, */*'
+                    },
+                    mode: 'cors',
+                    cache: 'no-cache'
                 });
-                
+
                 if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
                 }
+
+                const text = await response.text();
                 
-                const csvText = await response.text();
-                
-                // Validate CSV content
-                if (!csvText || csvText.includes('<!DOCTYPE') || csvText.includes('<html')) {
-                    throw new Error('Invalid CSV response');
+                // 빈 응답 체크
+                if (!text || text.trim().length === 0) {
+                    throw new Error('빈 응답');
                 }
+
+                // HTML 에러 페이지 체크
+                if (text.includes('<!DOCTYPE') || text.includes('<html')) {
+                    throw new Error('HTML 에러 페이지 반환됨');
+                }
+
+                console.log(`✅ ${proxy.name} 성공!`);
+                console.log(`📊 데이터 크기: ${text.length} bytes`);
                 
-                rawData = parseCSV(csvText);
+                const rawData = proxy.isTSV ? parseTSV(text) : parseCSV(text);
                 
                 if (rawData.length === 0) {
-                    throw new Error('No data parsed from CSV');
+                    throw new Error('파싱된 데이터가 없음');
                 }
                 
-                processData();
-                console.log(`Successfully loaded data using proxy ${i + 1}`);
+                processData(rawData);
+                console.log(`✨ 처리 완료: ${rawData.length}개 행, ${processedData.dates.length}개 날짜, ${processedData.stores.length}개 지점`);
+                
                 return processedData;
+
             } catch (error) {
-                console.warn(`Proxy ${i + 1} failed:`, error.message);
-                lastError = error;
+                console.warn(`❌ ${proxy.name} 실패:`, error.message);
+                
+                // 마지막 시도였다면 에러 던지기
+                if (i === CORS_PROXIES.length - 1) {
+                    throw new Error(`모든 프록시 시도 실패. 마지막 에러: ${error.message}`);
+                }
+                
+                // 다음 프록시 시도 전 잠깐 대기
+                await new Promise(resolve => setTimeout(resolve, 500));
             }
         }
-        
-        // All proxies failed, throw error
-        throw new Error(`모든 데이터 로드 방법이 실패했습니다: ${lastError?.message || 'Unknown error'}`);
     }
 
-    /**
-     * Parse CSV text to array
-     */
-    function parseCSV(text) {
-        const lines = text.split('\n');
-        const result = [];
+    // CSV 파싱
+    function parseCSV(csvText) {
+        const lines = csvText.split('\n');
+        const data = [];
         
-        // Skip first 3 rows (headers start at row 3)
-        for (let i = 3; i < lines.length; i++) {
+        // 헤더는 4번째 줄(인덱스 3)
+        // 데이터는 5번째 줄(인덱스 4)부터
+        for (let i = 4; i < lines.length; i++) {
             const line = lines[i].trim();
             if (!line) continue;
             
-            const values = parseCSVLine(line);
-            if (values.length >= 6 && values[1]) { // Check if date exists
-                result.push({
-                    date: values[1],
-                    storeName: values[2],
-                    platform: values[3],
-                    mainKeyword: values[4],
-                    totalPosts: parseInt(values[5]) || 0,
-                    categoryKeyword1: values[6] || '',
-                    keyword1Posts: parseInt(values[7]) || 0,
-                    categoryKeyword2: values[8] || '',
-                    keyword2Posts: parseInt(values[9]) || 0,
-                    categoryKeyword3: values[10] || '',
-                    keyword3Posts: parseInt(values[11]) || 0
-                });
+            const columns = parseCSVLine(line);
+            
+            // 최소 12개 컬럼 필요
+            if (columns.length >= 12) {
+                // 데이터 유효성 검사
+                const storeName = columns[2]?.trim();
+                const platform = columns[3]?.trim();
+                
+                if (storeName && platform) {
+                    data.push({
+                        date: columns[1]?.trim() || '',
+                        storeName: storeName,
+                        platform: platform,
+                        mainKeyword: columns[4]?.trim() || '',
+                        totalPosts: parseInt(columns[5]) || 0,
+                        categoryKeyword1: columns[6]?.trim() || '',
+                        keyword1Posts: parseInt(columns[7]) || 0,
+                        categoryKeyword2: columns[8]?.trim() || '',
+                        keyword2Posts: parseInt(columns[9]) || 0,
+                        categoryKeyword3: columns[10]?.trim() || '',
+                        keyword3Posts: parseInt(columns[11]) || 0
+                    });
+                }
             }
         }
         
-        return result;
+        return data;
     }
 
-    /**
-     * Parse a single CSV line handling quoted values
-     */
+    // TSV 파싱
+    function parseTSV(tsvText) {
+        const lines = tsvText.split('\n');
+        const data = [];
+        
+        for (let i = 4; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (!line) continue;
+            
+            const columns = line.split('\t');
+            
+            if (columns.length >= 12) {
+                const storeName = columns[2]?.trim();
+                const platform = columns[3]?.trim();
+                
+                if (storeName && platform) {
+                    data.push({
+                        date: columns[1]?.trim() || '',
+                        storeName: storeName,
+                        platform: platform,
+                        mainKeyword: columns[4]?.trim() || '',
+                        totalPosts: parseInt(columns[5]) || 0,
+                        categoryKeyword1: columns[6]?.trim() || '',
+                        keyword1Posts: parseInt(columns[7]) || 0,
+                        categoryKeyword2: columns[8]?.trim() || '',
+                        keyword2Posts: parseInt(columns[9]) || 0,
+                        categoryKeyword3: columns[10]?.trim() || '',
+                        keyword3Posts: parseInt(columns[11]) || 0
+                    });
+                }
+            }
+        }
+        
+        return data;
+    }
+
+    // CSV 한 줄 파싱 (따옴표 처리)
     function parseCSVLine(line) {
         const result = [];
         let current = '';
@@ -125,171 +194,175 @@ const DATA_LOADER = (() => {
             const char = line[i];
             
             if (char === '"') {
-                inQuotes = !inQuotes;
+                if (inQuotes && line[i + 1] === '"') {
+                    // 연속된 따옴표는 하나의 따옴표로
+                    current += '"';
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
+                }
             } else if (char === ',' && !inQuotes) {
-                result.push(current.trim());
+                result.push(current);
                 current = '';
             } else {
                 current += char;
             }
         }
-        result.push(current.trim());
         
+        result.push(current);
         return result;
     }
 
-    /**
-     * Process raw data into structured format
-     */
-    function processData() {
-        const dateSet = new Set();
-        const storeSet = new Set();
-        const dataByDate = {};
-        const dataByStore = {};
+    // 데이터 가공
+    function processData(rawData) {
+        const uniqueDates = new Set();
+        const uniqueStores = new Set();
+        const byDate = {};
+        const byStore = {};
 
         rawData.forEach(row => {
-            // Collect unique dates and stores
-            if (row.date) dateSet.add(row.date);
-            if (row.storeName) storeSet.add(row.storeName);
-
-            // Group by date
-            if (!dataByDate[row.date]) {
-                dataByDate[row.date] = {};
-            }
-            if (!dataByDate[row.date][row.storeName]) {
-                dataByDate[row.date][row.storeName] = {
-                    naver: [],
-                    instagram: []
-                };
-            }
+            const dateStr = row.date;
+            const storeName = row.storeName;
             
-            const platform = row.platform === '네이버' ? 'naver' : 'instagram';
-            dataByDate[row.date][row.storeName][platform].push(row);
+            if (!dateStr || !storeName) return;
 
-            // Group by store
-            if (!dataByStore[row.storeName]) {
-                dataByStore[row.storeName] = {};
-            }
-            if (!dataByStore[row.storeName][row.date]) {
-                dataByStore[row.storeName][row.date] = {
-                    naver: [],
-                    instagram: []
-                };
-            }
-            dataByStore[row.storeName][row.date][platform].push(row);
+            uniqueDates.add(dateStr);
+            uniqueStores.add(storeName);
+
+            if (!byDate[dateStr]) byDate[dateStr] = [];
+            byDate[dateStr].push(row);
+
+            if (!byStore[storeName]) byStore[storeName] = [];
+            byStore[storeName].push(row);
         });
 
-        // Sort dates (newest first)
-        const sortedDates = Array.from(dateSet).sort((a, b) => {
-            const [aMonth, aDay] = a.split('/').map(Number);
-            const [bMonth, bDay] = b.split('/').map(Number);
-            if (aMonth !== bMonth) return bMonth - aMonth;
-            return bDay - aDay;
+        // 날짜 정렬 (최신순)
+        processedData.dates = Array.from(uniqueDates).sort((a, b) => {
+            const dateA = parseDateString(a);
+            const dateB = parseDateString(b);
+            return dateB - dateA;
         });
 
-        processedData = {
-            dates: sortedDates,
-            stores: Array.from(storeSet),
-            dataByDate,
-            dataByStore,
-            rawData
-        };
+        processedData.stores = Array.from(uniqueStores).sort();
+        processedData.dataByDate = byDate;
+        processedData.dataByStore = byStore;
     }
 
-    /**
-     * Get data for a specific date
-     */
-    function getDataByDate(date) {
-        return processedData.dataByDate[date] || {};
+    // 날짜 문자열을 Date 객체로 변환
+    function parseDateString(dateStr) {
+        const parts = dateStr.split('/');
+        if (parts.length === 2) {
+            const month = parseInt(parts[0]);
+            const day = parseInt(parts[1]);
+            return new Date(2024, month - 1, day);
+        }
+        return new Date(dateStr);
     }
 
-    /**
-     * Get data for a specific store
-     */
-    function getDataByStore(storeName) {
-        return processedData.dataByStore[storeName] || {};
-    }
-
-    /**
-     * Calculate week-over-week comparison
-     */
+    // 전주 대비 증감률 계산
     function calculateWeeklyComparison() {
-        const comparison = {};
-        const dates = processedData.dates;
-        
-        if (dates.length < 7) {
-            console.warn('Not enough data for weekly comparison');
-            return comparison;
+        const result = {};
+        const sortedDates = [...processedData.dates].sort((a, b) => {
+            return parseDateString(b) - parseDateString(a);
+        });
+
+        if (sortedDates.length < 7) {
+            console.warn('7일 이상의 데이터가 필요합니다.');
+            return result;
         }
 
-        // Get last 7 days and previous 7 days
-        const lastWeek = dates.slice(0, 7);
-        const previousWeek = dates.slice(7, 14);
+        const recentWeek = sortedDates.slice(0, 7);
+        const previousWeek = sortedDates.slice(7, 14);
 
-        processedData.stores.forEach(store => {
-            comparison[store] = {
-                naver: {},
-                instagram: {}
+        processedData.stores.forEach(storeName => {
+            const storeData = processedData.dataByStore[storeName] || [];
+
+            const recentData = storeData.filter(row => 
+                recentWeek.includes(row.date)
+            );
+
+            const previousData = storeData.filter(row => 
+                previousWeek.includes(row.date)
+            );
+
+            const keywordStats = {};
+
+            const processWeekData = (data, isRecent) => {
+                data.forEach(row => {
+                    const platform = row.platform;
+                    const mainKeyword = row.mainKeyword;
+                    const key = `${platform}_${mainKeyword}`;
+
+                    if (!keywordStats[key]) {
+                        keywordStats[key] = {
+                            platform,
+                            mainKeyword,
+                            recentTotal: 0,
+                            recentCount: 0,
+                            previousTotal: 0,
+                            previousCount: 0
+                        };
+                    }
+
+                    const totalPosts = row.totalPosts || 0;
+                    if (isRecent) {
+                        keywordStats[key].recentTotal += totalPosts;
+                        keywordStats[key].recentCount++;
+                    } else {
+                        keywordStats[key].previousTotal += totalPosts;
+                        keywordStats[key].previousCount++;
+                    }
+                });
             };
 
-            ['naver', 'instagram'].forEach(platform => {
-                const lastWeekData = {};
-                const previousWeekData = {};
+            processWeekData(recentData, true);
+            processWeekData(previousData, false);
 
-                // Aggregate last week data
-                lastWeek.forEach(date => {
-                    const storeData = processedData.dataByStore[store]?.[date]?.[platform] || [];
-                    storeData.forEach(row => {
-                        if (!lastWeekData[row.mainKeyword]) {
-                            lastWeekData[row.mainKeyword] = 0;
-                        }
-                        lastWeekData[row.mainKeyword] += row.totalPosts;
-                    });
-                });
+            const comparisons = Object.values(keywordStats).map(stat => {
+                const recentAvg = stat.recentCount > 0 
+                    ? stat.recentTotal / stat.recentCount 
+                    : 0;
+                const previousAvg = stat.previousCount > 0 
+                    ? stat.previousTotal / stat.previousCount 
+                    : 0;
 
-                // Aggregate previous week data
-                previousWeek.forEach(date => {
-                    const storeData = processedData.dataByStore[store]?.[date]?.[platform] || [];
-                    storeData.forEach(row => {
-                        if (!previousWeekData[row.mainKeyword]) {
-                            previousWeekData[row.mainKeyword] = 0;
-                        }
-                        previousWeekData[row.mainKeyword] += row.totalPosts;
-                    });
-                });
+                let changePercent = 0;
+                if (previousAvg > 0) {
+                    changePercent = ((recentAvg - previousAvg) / previousAvg) * 100;
+                } else if (recentAvg > 0) {
+                    changePercent = 100;
+                }
 
-                // Calculate averages and change rates
-                Object.keys({...lastWeekData, ...previousWeekData}).forEach(keyword => {
-                    const lastAvg = (lastWeekData[keyword] || 0) / lastWeek.length;
-                    const prevAvg = (previousWeekData[keyword] || 0) / previousWeek.length;
-                    const change = prevAvg === 0 ? 
-                        (lastAvg > 0 ? 100 : 0) : 
-                        ((lastAvg - prevAvg) / prevAvg) * 100;
-
-                    comparison[store][platform][keyword] = {
-                        lastWeekAvg: lastAvg,
-                        previousWeekAvg: prevAvg,
-                        changeRate: change,
-                        lastWeekTotal: lastWeekData[keyword] || 0,
-                        previousWeekTotal: previousWeekData[keyword] || 0
-                    };
-                });
+                return {
+                    platform: stat.platform,
+                    mainKeyword: stat.mainKeyword,
+                    recentAvg: Math.round(recentAvg),
+                    previousAvg: Math.round(previousAvg),
+                    changePercent: Math.round(changePercent * 10) / 10
+                };
             });
+
+            if (comparisons.length > 0) {
+                result[storeName] = comparisons;
+            }
         });
 
-        return comparison;
+        return result;
     }
 
-    /**
-     * Get all available dates
-     */
+    // Public API
+    function getDataByDate(date) {
+        return processedData.dataByDate[date] || [];
+    }
+
+    function getDataByStore(storeName) {
+        return processedData.dataByStore[storeName] || [];
+    }
+
     function getDates() {
         return processedData.dates;
     }
 
-    /**
-     * Get all stores
-     */
     function getStores() {
         return processedData.stores;
     }
